@@ -1,0 +1,917 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PANDEMIC SURVIVAL</title>
+  <style>
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      background: #111;
+      color: #fff;
+      font-family: sans-serif;
+    }
+    .wrap {
+      width: 400px;
+      max-width: 95vw;
+      text-align: center;
+    }
+    .top {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 10px;
+      font-size: 18px;
+    }
+    .hp-track {
+      height: 10px;
+      background: #333;
+      border-radius: 999px;
+      overflow: hidden;
+      margin-bottom: 10px;
+    }
+    .hp-bar {
+      height: 100%;
+      width: 100%;
+      background: #7cfc00;
+    }
+    canvas {
+      width: 100%;
+      display: block;
+      background: #000;
+      border-radius: 12px;
+      touch-action: none;
+    }
+    button {
+      margin-top: 12px;
+      padding: 10px 16px;
+      border: none;
+      border-radius: 8px;
+      font-size: 16px;
+      cursor: pointer;
+    }
+    p {
+      margin-top: 10px;
+      font-size: 14px;
+      color: #ddd;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top">
+      <div>Case: <span id="score">0</span></div>
+      <div>Vital: <span id="hpText">5 / 5</span></div>
+      <div>Peak: <span id="best">0</span></div>
+    </div>
+    <div class="hp-track"><div id="hpBar" class="hp-bar"></div></div>
+    <canvas id="game" width="400" height="600"></canvas>
+    <button id="start">Start / Restart</button>
+      <button id="audioToggle">Audio ON</button>
+    <p>PC: ← ↑ ↓ → / スマホ: 下1/3をスワイプ</p>
+  </div>
+
+  <script>
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+    const scoreEl = document.getElementById('score');
+    const hpTextEl = document.getElementById('hpText');
+    const hpBarEl = document.getElementById('hpBar');
+    const bestEl = document.getElementById('best');
+    const startBtn = document.getElementById('start');
+    const audioToggleBtn = document.getElementById('audioToggle');
+
+    const W = canvas.width;
+    const H = canvas.height;
+    const MAX_HP = 5;
+    const CLEAR_SCORE = 200;
+    const BARRIER_FRAMES = 420;
+    const RETURN_FRAMES = 600;
+    const BEST_KEY = 'simple_dodge_best';
+    const THRESHOLD_SPEED = 15;
+    const THRESHOLD_MUTANT = 45;
+    const THRESHOLD_DOMINANT = 80;
+    const THRESHOLD_CALM = 150;
+    const NOTICE_FRAMES = 420;
+
+    let audioCtx = null;
+    let bgmTimer = null;
+
+    function ensureAudio() {
+      if (audioCtx) return;
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      audioCtx = new AC();
+    }
+
+    function tone(freq, when, dur, type = 'sine', volume = 0.03) {
+      if (!audioCtx) return;
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = type;
+      osc.frequency.setValueAtTime(freq, when);
+      gain.gain.setValueAtTime(0.0001, when);
+      gain.gain.exponentialRampToValueAtTime(volume, when + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, when + dur);
+      osc.connect(gain);
+      gain.connect(audioCtx.destination);
+      osc.start(when);
+      osc.stop(when + dur + 0.03);
+    }
+
+    function startBgm() {
+      ensureAudio();
+      if (!audioCtx || bgmTimer || !state.audioOn) return;
+      if (audioCtx.state === 'suspended') audioCtx.resume();
+      const playBar = () => {
+        const now = audioCtx.currentTime + 0.03;
+        const bass = state.opening ? [196,196,220,196] : [146.83,164.81,174.61,164.81];
+        const lead = state.opening
+          ? [392,440,523.25,587.33,523.25,440,392,523.25]
+          : [349.23,392,440,392,349.23,392,523.25,440];
+        for (let i = 0; i < bass.length; i++) tone(bass[i], now + i * 0.5, 0.35, 'triangle', 0.02);
+        for (let i = 0; i < lead.length; i++) tone(lead[i], now + i * 0.25, 0.18, 'square', 0.025);
+      };
+      playBar();
+      bgmTimer = setInterval(playBar, 2000);
+    }
+
+    function stopBgm() {
+      if (bgmTimer) {
+        clearInterval(bgmTimer);
+        bgmTimer = null;
+      }
+    }
+
+    function healSfx() {
+      ensureAudio();
+      if (!audioCtx || !state.audioOn) return;
+      const t = audioCtx.currentTime + 0.01;
+      tone(659.25, t, 0.08, 'triangle', 0.04);
+      tone(783.99, t + 0.06, 0.10, 'triangle', 0.04);
+      tone(987.77, t + 0.12, 0.12, 'sine', 0.035);
+    }
+
+    function barrierSfx() {
+      ensureAudio();
+      if (!audioCtx || !state.audioOn) return;
+      const t = audioCtx.currentTime + 0.01;
+      tone(392, t, 0.10, 'sine', 0.035);
+      tone(523.25, t + 0.05, 0.12, 'triangle', 0.04);
+      tone(783.99, t + 0.10, 0.18, 'triangle', 0.04);
+    }
+
+    function hitSfx(dead) {
+      ensureAudio();
+      if (!audioCtx || !state.audioOn) return;
+      const t = audioCtx.currentTime + 0.01;
+      if (dead) {
+        tone(110, t, 0.16, 'sawtooth', 0.05);
+        tone(82.41, t + 0.07, 0.22, 'square', 0.05);
+        tone(55, t + 0.15, 0.34, 'triangle', 0.045);
+      } else {
+        tone(180, t, 0.08, 'square', 0.045);
+        tone(120, t + 0.04, 0.10, 'sawtooth', 0.04);
+        tone(80, t + 0.08, 0.12, 'square', 0.035);
+      }
+    }
+
+    const state = {
+      player: null,
+      enemies: [],
+      particles: [],
+      score: 0,
+      hp: MAX_HP,
+      best: 0,
+      running: false,
+      opening: true,
+      gameOver: false,
+      gameClear: false,
+      returnTimer: 0,
+      frame: 0,
+      left: false,
+      right: false,
+      up: false,
+      down: false,
+      dragging: false,
+      damageFlash: 0,
+      invincible: 0,
+      barrier: 0,
+      startNotice: 0,
+      speedUpNotice: 0,
+      mutantNotice: 0,
+      mutantPowerNotice: 0,
+      calmNotice: 0,
+      speedUpShown: false,
+      mutantShown: false,
+      mutantPowerShown: false,
+      calmNoticeShown: false,
+      creditY: H + 40,
+      creditFinished: false,
+      endingHold: 0,
+      audioOn: true
+    };
+
+    function clamp(v, min, max) {
+      return Math.max(min, Math.min(max, v));
+    }
+
+    function lowerY() {
+      return H * 2 / 3;
+    }
+
+    function roundedRectPath(x, y, w, h, r) {
+      const rr = Math.min(r, w / 2, h / 2);
+      ctx.beginPath();
+      ctx.moveTo(x + rr, y);
+      ctx.lineTo(x + w - rr, y);
+      ctx.quadraticCurveTo(x + w, y, x + w, y + rr);
+      ctx.lineTo(x + w, y + h - rr);
+      ctx.quadraticCurveTo(x + w, y + h, x + w - rr, y + h);
+      ctx.lineTo(x + rr, y + h);
+      ctx.quadraticCurveTo(x, y + h, x, y + h - rr);
+      ctx.lineTo(x, y + rr);
+      ctx.quadraticCurveTo(x, y, x + rr, y);
+      ctx.closePath();
+    }
+
+    function capsulePath(cx, cy, w, h) {
+      const r = h / 2;
+      ctx.beginPath();
+      ctx.arc(cx - w / 2 + r, cy, r, Math.PI / 2, Math.PI * 1.5);
+      ctx.arc(cx + w / 2 - r, cy, r, Math.PI * 1.5, Math.PI / 2);
+      ctx.closePath();
+    }
+
+    function loadBest() {
+      return Number(localStorage.getItem(BEST_KEY) || 0);
+    }
+
+    function saveBest() {
+      if (state.score > state.best) {
+        state.best = state.score;
+        localStorage.setItem(BEST_KEY, String(state.best));
+      }
+      bestEl.textContent = String(state.best);
+    }
+
+    function syncUi() {
+      scoreEl.textContent = String(state.score);
+      hpTextEl.textContent = `${state.hp} / ${MAX_HP}`;
+      hpBarEl.style.width = `${(state.hp / MAX_HP) * 100}%`;
+      bestEl.textContent = String(state.best);
+    }
+
+    function resetGame(startNow) {
+      state.player = { x: 180, y: 520, w: 40, h: 40, speed: 6 };
+      state.enemies = [];
+      state.particles = [];
+      state.score = 0;
+      state.hp = MAX_HP;
+      state.best = loadBest();
+      state.running = !!startNow;
+      state.opening = !startNow;
+      state.gameOver = false;
+      state.gameClear = false;
+      state.returnTimer = 0;
+      state.frame = 0;
+      state.left = false;
+      state.right = false;
+      state.up = false;
+      state.down = false;
+      state.dragging = false;
+      state.damageFlash = 0;
+      state.invincible = 0;
+      state.barrier = 0;
+      state.startNotice = startNow ? NOTICE_FRAMES : 0;
+      state.speedUpNotice = 0;
+      state.mutantNotice = 0;
+      state.mutantPowerNotice = 0;
+      state.calmNotice = 0;
+      state.speedUpShown = false;
+      state.mutantShown = false;
+      state.mutantPowerShown = false;
+      state.calmNoticeShown = false;
+      state.creditY = H + 40;
+      state.creditFinished = false;
+      state.endingHold = 0;
+      syncUi();
+    }
+
+    function startGame() {
+      resetGame(true);
+      if (state.audioOn) startBgm();
+    }
+
+    function finishGame(clear) {
+      stopBgm();
+      state.running = false;
+      state.gameOver = !clear;
+      state.gameClear = clear;
+      state.opening = false;
+      if (clear) {
+        state.creditY = H + 40;
+        state.creditFinished = false;
+        state.endingHold = 0;
+        state.returnTimer = 999999;
+      } else {
+        state.returnTimer = RETURN_FRAMES;
+      }
+      saveBest();
+    }
+
+    function speedBonus() {
+      let bonus = 0;
+      if (state.score >= THRESHOLD_SPEED) bonus += 0.9;
+      if (state.score >= THRESHOLD_DOMINANT) bonus += 1.2;
+      return bonus;
+    }
+
+    function spawnEnemy() {
+      const roll = Math.random();
+      const shield = roll < 0.04;
+      const heal = !shield && roll < 0.12;
+      const forcedMutant = state.score >= THRESHOLD_DOMINANT;
+      const mutant = !heal && !shield && (forcedMutant || (state.score >= THRESHOLD_MUTANT && Math.random() < 0.24));
+      const r = shield ? 13 : heal ? 12 : 11 + Math.random() * 13;
+      const moving = heal || shield || Math.random() < 0.65;
+      const baseDx = moving ? (Math.random() < 0.5 ? -1 : 1) * (0.8 + Math.random() * 1.6) : 0;
+      state.enemies.push({
+        x: r + Math.random() * (W - r * 2),
+        y: -r - Math.random() * 30,
+        r,
+        dx: mutant ? baseDx * 1.3 : baseDx,
+        dy: 2 + Math.random() * 2 + state.score * 0.03 + speedBonus(),
+        heal,
+        shield,
+        mutant,
+        wave: Math.random() * Math.PI * 2,
+        waveSpeed: mutant ? 0.08 + Math.random() * 0.08 : 0.05 + Math.random() * 0.04,
+        curveAmp: mutant ? 1.4 + Math.random() * 1.8 : 0.6 + Math.random() * 1.2,
+        dashCooldown: mutant ? 10 + Math.floor(Math.random() * 16) : 20 + Math.floor(Math.random() * 30),
+        angle: Math.random() * Math.PI * 2,
+        spin: (Math.random() < 0.5 ? -1 : 1) * (mutant ? 0.07 + Math.random() * 0.06 : 0.04 + Math.random() * 0.04),
+        glow: Math.random() * Math.PI * 2
+      });
+    }
+
+    function updateEnemy(enemy) {
+      if (enemy.mutant) {
+        enemy.wave += enemy.waveSpeed;
+        enemy.dashCooldown -= 1;
+        enemy.dx += Math.sin(enemy.wave) * 0.11 * enemy.curveAmp;
+        enemy.dx += Math.cos(enemy.wave * 0.6) * 0.045 * enemy.curveAmp;
+        if (enemy.dashCooldown <= 0) {
+          enemy.dx += (Math.random() < 0.5 ? -1 : 1) * (1.8 + Math.random() * 2.2);
+          enemy.dy += Math.random() * 0.8;
+          enemy.dashCooldown = 8 + Math.floor(Math.random() * 14);
+        }
+        enemy.dx = clamp(enemy.dx, -5.2, 5.2);
+      }
+      enemy.x += enemy.dx;
+      enemy.y += enemy.dy;
+      enemy.angle += enemy.spin;
+      if (enemy.x - enemy.r < 0) {
+        enemy.x = enemy.r;
+        enemy.dx = Math.abs(enemy.dx) * (enemy.mutant ? 1.05 : 1);
+      }
+      if (enemy.x + enemy.r > W) {
+        enemy.x = W - enemy.r;
+        enemy.dx = -Math.abs(enemy.dx) * (enemy.mutant ? 1.05 : 1);
+      }
+    }
+
+    function movePlayerTo(clientX, clientY) {
+      const rect = canvas.getBoundingClientRect();
+      const x = (clientX - rect.left) * (W / rect.width);
+      const y = (clientY - rect.top) * (H / rect.height);
+      state.player.x = clamp(x - state.player.w / 2, 0, W - state.player.w);
+      state.player.y = clamp(y - state.player.h / 2, lowerY(), H - state.player.h);
+    }
+
+    function hit(enemy) {
+      const p = state.player;
+      const cx = clamp(enemy.x, p.x, p.x + p.w);
+      const cy = clamp(enemy.y, p.y, p.y + p.h);
+      const dx = enemy.x - cx;
+      const dy = enemy.y - cy;
+      return dx * dx + dy * dy < enemy.r * enemy.r;
+    }
+
+    function spawnBarrierParticles(enemy) {
+      for (let i = 0; i < 24; i++) {
+        const a = Math.random() * Math.PI * 2;
+        const sp = 1.6 + Math.random() * 4.4;
+        state.particles.push({
+          x: enemy.x,
+          y: enemy.y,
+          vx: Math.cos(a) * sp,
+          vy: Math.sin(a) * sp,
+          life: 22 + Math.floor(Math.random() * 16),
+          size: 2 + Math.random() * 4
+        });
+      }
+    }
+
+    function updateParticles() {
+      for (let i = state.particles.length - 1; i >= 0; i--) {
+        const pt = state.particles[i];
+        pt.x += pt.vx;
+        pt.y += pt.vy;
+        pt.life -= 1;
+        if (pt.life <= 0) state.particles.splice(i, 1);
+      }
+    }
+
+    function update() {
+      if (!state.running) {
+        if (state.gameClear) {
+          if (!state.creditFinished) {
+            state.creditY -= 0.33;
+            if (state.creditY <= -260) {
+              state.creditFinished = true;
+              state.endingHold = 300;
+            }
+          } else if (state.endingHold > 0) {
+            state.endingHold -= 1;
+            if (state.endingHold <= 0) resetGame(false);
+          }
+        } else if (state.gameOver && state.returnTimer > 0) {
+          state.returnTimer -= 1;
+          if (state.returnTimer <= 0) resetGame(false);
+        }
+        return;
+      }
+
+      state.frame += 1;
+      updateParticles();
+      if (state.damageFlash > 0) state.damageFlash -= 1;
+      if (state.invincible > 0) state.invincible -= 1;
+      if (state.barrier > 0) state.barrier -= 1;
+      if (state.startNotice > 0) state.startNotice -= 1;
+      if (state.speedUpNotice > 0) state.speedUpNotice -= 1;
+      if (state.mutantNotice > 0) state.mutantNotice -= 1;
+      if (state.mutantPowerNotice > 0) state.mutantPowerNotice -= 1;
+      if (state.calmNotice > 0) state.calmNotice -= 1;
+
+      if (!state.speedUpShown && state.score >= THRESHOLD_SPEED) {
+        state.speedUpShown = true;
+        state.speedUpNotice = NOTICE_FRAMES;
+      }
+      if (!state.mutantShown && state.score >= THRESHOLD_MUTANT) {
+        state.mutantShown = true;
+        state.mutantNotice = NOTICE_FRAMES;
+      }
+      if (!state.mutantPowerShown && state.score >= THRESHOLD_DOMINANT) {
+        state.mutantPowerShown = true;
+        state.mutantPowerNotice = NOTICE_FRAMES;
+      }
+      if (!state.calmNoticeShown && state.score >= THRESHOLD_CALM) {
+        state.calmNoticeShown = true;
+        state.calmNotice = NOTICE_FRAMES;
+      }
+
+      if (!state.dragging) {
+        if (state.left) state.player.x -= state.player.speed;
+        if (state.right) state.player.x += state.player.speed;
+        if (state.up) state.player.y -= state.player.speed;
+        if (state.down) state.player.y += state.player.speed;
+      }
+
+      state.player.x = clamp(state.player.x, 0, W - state.player.w);
+      state.player.y = clamp(state.player.y, lowerY(), H - state.player.h);
+
+      let spawnInterval = Math.max(16, 38 - Math.floor(state.score / 8));
+      if (state.score >= THRESHOLD_DOMINANT) spawnInterval = Math.max(10, spawnInterval - 6);
+      if (state.frame % spawnInterval === 0) spawnEnemy();
+      if (state.score >= THRESHOLD_DOMINANT && state.frame % (spawnInterval + 3) === 0) spawnEnemy();
+
+      for (let i = state.enemies.length - 1; i >= 0; i--) {
+        const enemy = state.enemies[i];
+        updateEnemy(enemy);
+
+        if (hit(enemy)) {
+          state.enemies.splice(i, 1);
+          if (enemy.heal) {
+            state.hp = Math.min(MAX_HP, state.hp + 1);
+            syncUi();
+            healSfx();
+            continue;
+          }
+          if (enemy.shield) {
+            state.barrier = BARRIER_FRAMES;
+            state.invincible = BARRIER_FRAMES;
+            syncUi();
+            barrierSfx();
+            continue;
+          }
+          if (state.barrier > 0) {
+            spawnBarrierParticles(enemy);
+            continue;
+          }
+          if (state.invincible === 0) {
+            state.hp -= 1;
+            state.invincible = 30;
+            state.damageFlash = 12;
+            hitSfx(state.hp <= 0);
+            syncUi();
+            if (state.hp <= 0) {
+              finishGame(false);
+              return;
+            }
+          }
+          continue;
+        }
+
+        if (enemy.y - enemy.r > H) {
+          state.enemies.splice(i, 1);
+          if (!enemy.heal && !enemy.shield) {
+            state.score += 1;
+            syncUi();
+            if (state.score >= CLEAR_SCORE) {
+              finishGame(true);
+              return;
+            }
+          }
+        }
+      }
+    }
+
+    function drawCapsule(enemy, outerColor, innerColor) {
+      enemy.glow += 0.08;
+      const glow = 0.65 + 0.35 * Math.sin(enemy.glow);
+      const w = enemy.r * 2.2;
+      const h = enemy.r * 1.15;
+      ctx.save();
+      ctx.translate(enemy.x, enemy.y);
+      ctx.rotate(enemy.angle);
+      ctx.globalAlpha = glow;
+      ctx.fillStyle = outerColor;
+      capsulePath(0, 0, w + 12, h + 12);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = innerColor;
+      capsulePath(0, 0, w, h);
+      ctx.fill();
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(-2, -h * 0.42, 4, h * 0.84);
+      ctx.fillRect(-w * 0.22, -2, w * 0.44, 4);
+      ctx.restore();
+    }
+
+    function drawVirus(enemy) {
+      ctx.save();
+      ctx.translate(enemy.x, enemy.y);
+      ctx.rotate(enemy.angle);
+      if (enemy.mutant) ctx.scale(1.14, 0.92);
+      const spikeCount = enemy.mutant ? 18 : 14;
+      for (let i = 0; i < spikeCount; i++) {
+        const a = (Math.PI * 2 * i) / spikeCount;
+        const stemStart = enemy.r * 0.82;
+        const stemEnd = enemy.r + (enemy.mutant ? 12 : 7);
+        const x1 = Math.cos(a) * stemStart;
+        const y1 = Math.sin(a) * stemStart;
+        const x2 = Math.cos(a) * stemEnd;
+        const y2 = Math.sin(a) * stemEnd;
+        const hx = Math.cos(a) * (stemEnd + (enemy.mutant ? 5 : 3));
+        const hy = Math.sin(a) * (stemEnd + (enemy.mutant ? 5 : 3));
+        ctx.strokeStyle = enemy.mutant ? '#180008' : '#5a0a14';
+        ctx.lineWidth = enemy.mutant ? 4.2 : 3;
+        ctx.beginPath();
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(x2, y2);
+        ctx.stroke();
+        ctx.fillStyle = enemy.mutant ? '#24000d' : '#7a1320';
+        ctx.beginPath();
+        ctx.arc(hx, hy, enemy.mutant ? 5.2 : 3.8, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = enemy.mutant ? '#ff2f70' : '#b43a4a';
+        ctx.beginPath();
+        ctx.arc(hx - 0.8, hy - 0.8, enemy.mutant ? 3 : 2.1, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      const grad = ctx.createRadialGradient(-enemy.r * 0.35, -enemy.r * 0.35, enemy.r * 0.2, 0, 0, enemy.r * 1.18);
+      grad.addColorStop(0, enemy.mutant ? '#ff2f70' : '#d94a5b');
+      grad.addColorStop(0.34, enemy.mutant ? '#b4003a' : '#9e1f31');
+      grad.addColorStop(0.7, enemy.mutant ? '#430012' : '#5f0c18');
+      grad.addColorStop(1, enemy.mutant ? '#090003' : '#220007');
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(0, 0, enemy.r, 0, Math.PI * 2);
+      ctx.fill();
+      if (enemy.mutant) {
+        ctx.strokeStyle = 'rgba(255,45,110,0.95)';
+        ctx.lineWidth = 2.6;
+        ctx.beginPath();
+        ctx.arc(0, 0, enemy.r * 1.05, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    function drawPlayer() {
+      const p = state.player;
+      const px = p.x;
+      const py = p.y;
+      const pw = p.w;
+      const ph = p.h;
+      const cx = px + pw / 2;
+      const cy = py + ph / 2;
+      let coatColor = '#f7f7f7';
+      if (state.damageFlash > 0) coatColor = state.damageFlash % 4 < 2 ? '#ffb3b3' : '#ffe0e0';
+      else if (state.barrier > 0) coatColor = state.barrier % 10 < 5 ? '#dff6ff' : '#f7fbff';
+      else if (state.hp === 1) coatColor = '#d8b0b0';
+      else if (state.invincible > 0 && state.invincible % 6 < 3) coatColor = '#d9f0f8';
+
+      ctx.fillStyle = '#f2c7a5';
+      ctx.beginPath();
+      ctx.arc(cx, py + 10, 8.5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#2f2f2f';
+      roundedRectPath(cx - 9, py + 1, 18, 6, 4);
+      ctx.fill();
+      ctx.fillStyle = '#1f1f1f';
+      ctx.beginPath();
+      ctx.arc(cx - 3, py + 10, 1, 0, Math.PI * 2);
+      ctx.arc(cx + 3, py + 10, 1, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = '#9b5a5a';
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      ctx.arc(cx, py + 13, 3, 0.15, Math.PI - 0.15);
+      ctx.stroke();
+      ctx.fillStyle = coatColor;
+      roundedRectPath(px + 8, py + 18, pw - 16, ph - 20, 8);
+      ctx.fill();
+      ctx.fillStyle = '#e8eef4';
+      ctx.beginPath();
+      ctx.moveTo(px + 12, py + 20);
+      ctx.lineTo(cx, py + 29);
+      ctx.lineTo(cx - 2, py + ph - 4);
+      ctx.lineTo(px + 12, py + ph - 4);
+      ctx.closePath();
+      ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(px + pw - 12, py + 20);
+      ctx.lineTo(cx, py + 29);
+      ctx.lineTo(cx + 2, py + ph - 4);
+      ctx.lineTo(px + pw - 12, py + ph - 4);
+      ctx.closePath();
+      ctx.fill();
+      ctx.strokeStyle = '#7a8794';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(cx - 6, py + 25, 5, Math.PI * 0.1, Math.PI * 1.9);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(cx + 6, py + 25, 5, Math.PI * 1.1, Math.PI * 0.9, true);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(cx - 1, py + 30);
+      ctx.lineTo(cx - 1, py + 38);
+      ctx.stroke();
+      ctx.fillStyle = '#5aa6d6';
+      roundedRectPath(cx + 3, py + 28, 6, 9, 2);
+      ctx.fill();
+      ctx.fillStyle = '#f2c7a5';
+      roundedRectPath(px + 4, py + 22, 5, 12, 2);
+      ctx.fill();
+      roundedRectPath(px + pw - 9, py + 22, 5, 12, 2);
+      ctx.fill();
+
+      if (state.hp === 1 && state.damageFlash === 0 && state.barrier === 0) {
+        ctx.fillStyle = 'rgba(255,80,80,0.18)';
+        roundedRectPath(px + 8, py + 18, pw - 16, ph - 20, 9);
+        ctx.fill();
+        ctx.fillStyle = 'rgba(255,120,120,0.12)';
+        ctx.beginPath();
+        ctx.arc(cx, cy, 18, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      if (state.barrier > 0) {
+        const pulse = state.barrier % 16 < 8;
+        const colors = pulse
+          ? ['#7dd3fc','#5fd0ff','rgba(125,211,252,0.85)','rgba(125,211,252,0.72)','rgba(125,211,252,0.60)','rgba(125,211,252,0.48)','rgba(125,211,252,0.36)','rgba(125,211,252,0.24)']
+          : ['#d6f4ff','#bff1ff','rgba(214,244,255,0.88)','rgba(214,244,255,0.74)','rgba(214,244,255,0.62)','rgba(214,244,255,0.50)','rgba(214,244,255,0.38)','rgba(214,244,255,0.26)'];
+        const radii = [24,30,36,42,48,54,60,66];
+        const widths = [5,4.5,4,3.5,3,2.5,2,1.5];
+        for (let i = 0; i < radii.length; i++) {
+          ctx.strokeStyle = colors[i];
+          ctx.lineWidth = widths[i];
+          ctx.beginPath();
+          ctx.arc(cx, cy, radii[i], 0, Math.PI * 2);
+          ctx.stroke();
+        }
+        ctx.fillStyle = pulse ? 'rgba(125,211,252,0.08)' : 'rgba(214,244,255,0.06)';
+        ctx.beginPath();
+        ctx.arc(cx, cy, radii[0], 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    function drawParticles() {
+      for (let i = 0; i < state.particles.length; i++) {
+        const pt = state.particles[i];
+        const alpha = pt.life / 38;
+        ctx.fillStyle = `rgba(180,230,255,${alpha})`;
+        ctx.beginPath();
+        ctx.arc(pt.x, pt.y, pt.size, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = `rgba(255,255,255,${alpha * 0.7})`;
+        ctx.fillRect(pt.x - 1, pt.y - 1, 2, 2);
+      }
+    }
+
+    function drawCredits() {
+      const lines = [
+        { text: 'OUTBREAK CONTAINED', size: 30, gap: 46, bold: true },
+        { text: '感染症対策最終報告', size: 20, gap: 42, bold: true },
+        { text: '主任対応医', size: 16, gap: 28, bold: false },
+        { text: 'PANDEMIC SURVIVAL PLAYER', size: 22, gap: 42, bold: true },
+        { text: '臨床所見', size: 16, gap: 28, bold: false },
+        { text: '病原体曝露リスクは許容域まで低下', size: 16, gap: 28, bold: false },
+        { text: '変異株流行フェーズに対する回避行動を完遂', size: 16, gap: 28, bold: false },
+        { text: 'バイタルは臨床的安定を維持', size: 16, gap: 28, bold: false },
+        { text: '感染制御プロトコルは目標症例数に到達', size: 16, gap: 38, bold: false },
+        { text: '院内判定', size: 16, gap: 28, bold: false },
+        { text: '封じ込め成功', size: 24, gap: 44, bold: true },
+        { text: 'Thank you for your clinical response', size: 16, gap: 40, bold: false },
+        { text: state.creditFinished ? '5秒後に初期画面へ戻る' : ' ', size: 14, gap: 30, bold: false }
+      ];
+      let y = state.creditY;
+      ctx.fillStyle = '#fff';
+      ctx.textAlign = 'center';
+      for (const line of lines) {
+        ctx.font = `${line.bold ? 'bold ' : ''}${line.size}px sans-serif`;
+        if (y > -120 && y < H + 120) ctx.fillText(line.text, W / 2, y);
+        y += line.gap;
+      }
+    }
+
+    function drawInfoBox(yTop, fill, stroke, title, lines, titleSize) {
+      ctx.fillStyle = fill;
+      ctx.fillRect(0, yTop, W, 136);
+      ctx.strokeStyle = stroke;
+      ctx.lineWidth = 4;
+      ctx.strokeRect(12, yTop + 10, W - 24, 116);
+      ctx.fillStyle = '#fff';
+      ctx.font = `bold ${titleSize}px sans-serif`;
+      ctx.fillText(title, W / 2, yTop + 36);
+      ctx.font = '14px sans-serif';
+      ctx.fillText(lines[0], W / 2, yTop + 72);
+      ctx.fillText(lines[1], W / 2, yTop + 96);
+      ctx.fillText(lines[2], W / 2, yTop + 120);
+    }
+
+    function drawOverlay() {
+      if (state.barrier > 0) {
+        ctx.fillStyle = 'rgba(180, 230, 255, 0.9)';
+        ctx.font = 'bold 18px sans-serif';
+        ctx.textAlign = 'left';
+        ctx.fillText('Barrier ' + (state.barrier / 60).toFixed(1) + 's', 12, 24);
+      }
+
+      ctx.textAlign = 'center';
+      if (state.opening) {
+        ctx.fillStyle = 'rgba(0,0,0,0.75)';
+        ctx.fillRect(0, 0, W, H);
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 30px sans-serif';
+        ctx.fillText('PANDEMIC SURVIVAL', W / 2, 130);
+        ctx.font = '18px sans-serif';
+        ctx.fillText('病原体接触を回避せよ', W / 2, 180);
+        ctx.fillText('治療薬カプセルでVital回復', W / 2, 215);
+        ctx.fillText('抗体カプセルで7秒防御', W / 2, 250);
+        ctx.fillText('15で感染拡大フェーズ', W / 2, 285);
+        ctx.fillText('45で変異株出現', W / 2, 320);
+        ctx.fillText('80で変異株優勢化', W / 2, 355);
+        ctx.fillText('150で鎮静化フェーズ', W / 2, 390);
+        ctx.fillText('スマホ: 下1/3をスワイプ', W / 2, 425);
+        ctx.font = 'bold 20px sans-serif';
+        ctx.fillText('感染制御達成: 200で終了', W / 2, 465);
+        ctx.fillText('Start / Restart で開始', W / 2, 500);
+      }
+      if (state.startNotice > 0 && state.running) {
+        const a = state.startNotice > 30 ? 1 : state.startNotice / 30;
+        ctx.save();
+        ctx.globalAlpha = a;
+        drawInfoBox(H * 0.04, 'rgba(255,255,255,0.14)', 'rgba(220,240,255,0.85)', '市中感染フェーズ開始', ['・標準予防策は全患者に適用する基本戦略。','・接触前後の手指衛生は最重要。','・曝露経路を意識したPPE選択が重要。'], 20);
+        ctx.restore();
+      }
+      if (state.speedUpNotice > 0 && state.running) {
+        const a = state.speedUpNotice > 30 ? 1 : state.speedUpNotice / 30;
+        ctx.save();
+        ctx.globalAlpha = a;
+        drawInfoBox(H * 0.04, 'rgba(255,180,0,0.20)', 'rgba(255,220,120,0.9)', '感染拡大フェーズのため加速', ['・実効再生産数 Rt > 1 では流行は拡大。','・流行曲線は介入の遅れを反映しやすい。','・早期診断と隔離で伝播を抑制する。'], 18);
+        ctx.restore();
+      }
+      if (state.mutantNotice > 0 && state.running) {
+        const a = state.mutantNotice > 30 ? 1 : state.mutantNotice / 30;
+        ctx.save();
+        ctx.globalAlpha = a;
+        drawInfoBox(H * 0.04, 'rgba(255,20,100,0.22)', 'rgba(255,70,130,0.9)', '変異株出現', ['・変異はスパイク蛋白などに生じうる。','・感染性、病原性、免疫回避能が変化しうる。','・ゲノム疫学は流行把握に有用。'], 22);
+        ctx.restore();
+      }
+      if (state.mutantPowerNotice > 0 && state.running) {
+        const a = state.mutantPowerNotice > 30 ? 1 : state.mutantPowerNotice / 30;
+        ctx.save();
+        ctx.globalAlpha = a;
+        drawInfoBox(H * 0.04, 'rgba(255,30,80,0.28)', 'rgba(255,80,120,0.95)', '変異株優勢化', ['・選択圧下では適応度の高い株が残る。','・ワクチン・既感染免疫の影響も受ける。','・優勢化は臨床像の変化を伴うことがある。'], 22);
+        ctx.restore();
+      }
+      if (state.calmNotice > 0 && state.running) {
+        const a = state.calmNotice > 30 ? 1 : state.calmNotice / 30;
+        ctx.save();
+        ctx.globalAlpha = a;
+        drawInfoBox(H * 0.04, 'rgba(120,220,180,0.20)', 'rgba(180,255,220,0.9)', 'ピークを超えて鎮静化へ移行', ['・感受性宿主の減少で伝播効率は低下。','・介入強化で流行曲線は下降へ向かう。','・終息判断には遅延報告の考慮が必要。'], 18);
+        ctx.restore();
+      }
+      if (state.gameOver) {
+        ctx.fillStyle = 'rgba(255,0,0,0.22)';
+        ctx.fillRect(0, 0, W, H);
+        ctx.strokeStyle = 'rgba(255,120,120,0.7)';
+        ctx.lineWidth = 12;
+        ctx.strokeRect(0, 0, W, H);
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 36px sans-serif';
+        ctx.fillText('CLINICAL FAILURE', W / 2, H / 2 - 8);
+        ctx.font = '20px sans-serif';
+        ctx.fillText('感染制御失敗', W / 2, H / 2 + 28);
+        ctx.font = '18px sans-serif';
+        ctx.fillText('10秒後に初期画面へ戻る', W / 2, H / 2 + 58);
+      }
+      if (state.gameClear) {
+        ctx.fillStyle = 'rgba(20,30,40,0.35)';
+        ctx.fillRect(0, 0, W, H);
+        drawCredits();
+      }
+    }
+
+    function draw() {
+      ctx.clearRect(0, 0, W, H);
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, W, H);
+      drawPlayer();
+      for (const enemy of state.enemies) {
+        if (enemy.heal) drawCapsule(enemy, '#ffd700', '#ffffff');
+        else if (enemy.shield) drawCapsule(enemy, '#8fd3ff', '#dff4ff');
+        else drawVirus(enemy);
+      }
+      drawParticles();
+      drawOverlay();
+    }
+
+    function loop() {
+      update();
+      draw();
+      requestAnimationFrame(loop);
+    }
+
+    startBtn.addEventListener('click', () => startGame());
+
+    audioToggleBtn.addEventListener('click', () => {
+      state.audioOn = !state.audioOn;
+      audioToggleBtn.textContent = state.audioOn ? 'Audio ON' : 'Audio OFF';
+      if (state.audioOn) startBgm();
+      else stopBgm();
+    });
+
+    window.addEventListener('keydown', (e) => {
+      if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)) e.preventDefault();
+      if (e.key === 'ArrowLeft') state.left = true;
+      if (e.key === 'ArrowRight') state.right = true;
+      if (e.key === 'ArrowUp') state.up = true;
+      if (e.key === 'ArrowDown') state.down = true;
+    });
+    window.addEventListener('keyup', (e) => {
+      if (e.key === 'ArrowLeft') state.left = false;
+      if (e.key === 'ArrowRight') state.right = false;
+      if (e.key === 'ArrowUp') state.up = false;
+      if (e.key === 'ArrowDown') state.down = false;
+    });
+    canvas.addEventListener('pointerdown', (e) => {
+      state.dragging = true;
+      movePlayerTo(e.clientX, e.clientY);
+    });
+    canvas.addEventListener('pointermove', (e) => {
+      if (state.dragging) movePlayerTo(e.clientX, e.clientY);
+    });
+    window.addEventListener('pointerup', () => {
+      state.dragging = false;
+    });
+    window.addEventListener('pointercancel', () => {
+      state.dragging = false;
+    });
+
+    resetGame(false);
+    audioToggleBtn.textContent = state.audioOn ? 'Audio ON' : 'Audio OFF';
+    if (state.audioOn) startBgm();
+    loop();
+  </script>
+</body>
+</html>
